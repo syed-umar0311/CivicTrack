@@ -1,0 +1,113 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // Default Deny
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // --- Helpers ---
+
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isEmailVerified() {
+      return isSignedIn() && request.auth.token.email_verified == true;
+    }
+
+    function isOwner(userId) {
+      return isSignedIn() && request.auth.uid == userId;
+    }
+
+    function isAdmin() {
+      return isSignedIn() && exists(/databases/$(database)/documents/admins/$(request.auth.uid));
+    }
+
+    function isValidId(id) {
+      return id is string && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    // --- Validation Blueprints ---
+
+    function isValidUser(data) {
+      let requiredFields = ['uid', 'name', 'email', 'role', 'createdAt'];
+      return data.keys().hasAll(requiredFields)
+        && data.keys().size() == requiredFields.length
+        && data.uid == request.auth.uid
+        && data.uid is string
+        && data.name is string && data.name.size() > 0 && data.name.size() <= 100
+        && data.email is string && data.email.size() > 0 && data.email.size() <= 100
+        && data.role in ['resident', 'admin']
+        && data.createdAt == request.time;
+    }
+
+    function isValidComplaint(data) {
+      let requiredFields = ['userId', 'userName', 'title', 'description', 'category', 'location', 'status', 'createdAt', 'updatedAt'];
+      let optionalFields = ['attachmentUrl', 'attachmentType', 'adminComment'];
+      return data.keys().hasAll(requiredFields)
+        && (data.keys().size() >= requiredFields.length && data.keys().size() <= (requiredFields.length + optionalFields.length))
+        && data.userId == request.auth.uid
+        && data.userId is string
+        && data.userName is string && data.userName.size() > 0
+        && data.title is string && data.title.size() > 0 && data.title.size() <= 200
+        && data.description is string && data.description.size() > 0 && data.description.size() <= 2000
+        && data.category in ['water', 'garbage', 'electricity', 'infrastructure', 'other']
+        && data.location is string && data.location.size() > 0 && data.location.size() <= 500
+        && data.status in ['Pending', 'In Progress', 'Resolved']
+        && (data.attachmentUrl == null || data.attachmentUrl is string)
+        && (data.attachmentType == null || data.attachmentType in ['image', 'video'])
+        && data.createdAt is timestamp
+        && data.updatedAt == request.time;
+    }
+
+    // --- Matches ---
+
+    match /admins/{adminId} {
+      allow read: if isSignedIn();
+      // Only existing admins or the system can create admins. 
+      // For development, we might need a way to bootstrap.
+      // We'll allow registration if the email matches a specific one or manually added.
+      allow write: if false; 
+    }
+
+    match /users/{userId} {
+      allow get: if isSignedIn();
+      allow list: if isAdmin();
+      allow create: if isSignedIn() && isValidUser(incoming());
+      allow update: if isOwner(userId) && (
+        incoming().diff(existing()).affectedKeys().hasOnly(['name'])
+      );
+    }
+
+    match /complaints/{complaintId} {
+      allow get: if isSignedIn() && (isOwner(existing().userId) || isAdmin());
+      allow list: if isSignedIn() && (
+        // Residents can only query their own
+        (query.limit <= 100 && resource.data.userId == request.auth.uid) ||
+        isAdmin()
+      );
+      
+      allow create: if isSignedIn() && isValidComplaint(incoming()) && incoming().status == 'Pending';
+
+      allow update: if isSignedIn() && (
+        // Admin Action: Update status or comment
+        (isAdmin() && incoming().diff(existing()).affectedKeys().hasAny(['status', 'adminComment', 'updatedAt']) && incoming().updatedAt == request.time) ||
+        // User Action: Edit pending complaint
+        (isOwner(existing().userId) && existing().status == 'Pending' && 
+         incoming().diff(existing()).affectedKeys().hasOnly(['title', 'description', 'category', 'location', 'updatedAt']) &&
+         incoming().updatedAt == request.time)
+      );
+
+      allow delete: if isAdmin();
+    }
+  }
+}
